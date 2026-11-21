@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>For You</title>
+<style>
+  /* single dark "night sky" look, full-screen canvas */
+  :root { --night: #05040d; --pink: #ff8fc1; --heart: #ff4f8f; color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: var(--night); overflow: hidden; }
+  canvas { display: block; position: fixed; inset: 0; }
+  #msg {
+    position: fixed; left: 0; right: 0; bottom: calc(4vh + env(safe-area-inset-bottom, 0px));
+    text-align: center; font: bold clamp(16px, 2.6vh, 26px) "Courier New", monospace;
+    color: var(--pink); letter-spacing: 0.15em;
+    text-shadow: 0 0 8px #ff4fa0, 0 0 22px #ff4fa088;
+    opacity: 0; transition: opacity 2.5s ease;
+    pointer-events: none;
+  }
+  #msg.show { opacity: 1; }
+  .heart { display: inline-block; color: var(--heart); animation: beat 1.2s ease-in-out infinite; }
+  @keyframes beat { 0%,100% { transform: scale(1); } 15% { transform: scale(1.3); } 30% { transform: scale(1); } 45% { transform: scale(1.18); } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="msg">for you <span class="heart">♥</span></div>
+<script>
+// ===================== settings =====================
+const SPIN_SPEED = 0.45;   // radians per second (one full turn ~14 s)
+const SWAY = 0.035;        // how much the flowers sway
+const TILT = 0.32;         // camera looks slightly down at the bouquet
+const D = 6;               // camera distance
+const RAMP = ".,-~:;=!*#$@";            // dark -> bright
+const CH = RAMP + "*+.~,'`";             // ramp + special characters
+const RL = RAMP.length;
+const L = (() => { const v = [-0.4, 0.4, 0.82], l = Math.hypot(...v); return v.map(x => x / l); })();
+const TAU = Math.PI * 2;
+
+// seeded random so the bouquet is the same every time
+let seed = 7;
+function rand() { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let t = Math.imul(seed ^ seed >>> 15, 1 | seed); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }
+
+// ===================== vector helpers =====================
+const norm = v => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const shade = (c, k) => [c[0] * k, c[1] * k, c[2] * k];
+const mix = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const clamp01 = x => x < 0 ? 0 : x > 1 ? 1 : x;
+function basisFrom(o, ax) {
+  ax = norm(ax);
+  const ref = Math.abs(ax[1]) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+  const u = norm(cross(ref, ax)), w = cross(ax, u);
+  return { o, ax, u, w };
+}
+const WORLD = { o: [0, 0, 0], ax: [0, 1, 0], u: [1, 0, 0], w: [0, 0, 1] };
+
+// ===================== point buffer =====================
+// stride: x y z nx ny nz r g b group extra(grow threshold)
+const ST = 11;
+class Buf {
+  constructor() { this.a = new Float32Array(ST * 4096); this.n = 0; }
+  push(x, y, z, nx, ny, nz, r, g, b, grp, ex) {
+    if ((this.n + 1) * ST > this.a.length) { const na = new Float32Array(this.a.length * 2); na.set(this.a); this.a = na; }
+    const o = this.n++ * ST, a = this.a;
+    a[o] = x; a[o + 1] = y; a[o + 2] = z; a[o + 3] = nx; a[o + 4] = ny; a[o + 5] = nz;
+    a[o + 6] = r; a[o + 7] = g; a[o + 8] = b; a[o + 9] = grp; a[o + 10] = ex;
+  }
+}
+function pushLocal(buf, B, p, n, c, grp, ex) {
+  const { o, ax, u, w } = B;
+  buf.push(
+    o[0] + p[0] * u[0] + p[1] * ax[0] + p[2] * w[0],
+    o[1] + p[0] * u[1] + p[1] * ax[1] + p[2] * w[1],
+    o[2] + p[0] * u[2] + p[1] * ax[2] + p[2] * w[2],
+    n[0] * u[0] + n[1] * ax[0] + n[2] * w[0],
+    n[0] * u[1] + n[1] * ax[1] + n[2] * w[1],
+    n[0] * u[2] + n[1] * ax[2] + n[2] * w[2],
+    c[0], c[1], c[2], grp, ex);
+}
+// sample a parametric surface f(u,v) -> [x,y,z]; normals by finite differences
+function surf(buf, B, nu, nv, f, color, grp, ex, clip, closed) {
+  const e = 1e-3;
+  for (let i = 0; i < nu; i++) {
+    const u = closed ? i / nu : i / Math.max(1, nu - 1);
+    for (let j = 0; j < nv; j++) {
+      const v = j / Math.max(1, nv - 1);
+      if (clip && !clip(u, v)) continue;
+      const p = f(u, v), pu = f(u + e, v), pv = f(u, v + e);
+      const n = norm(cross([pu[0] - p[0], pu[1] - p[1], pu[2] - p[2]], [pv[0] - p[0], pv[1] - p[1], pv[2] - p[2]]));
+      const c = typeof color === "function" ? color(u, v) : color;
+      pushLocal(buf, B, p, n, c, grp, typeof ex === "function" ? ex(u, v) : ex);
+    }
+  }
+}
+
+// ===================== the flowers =====================
+const flowers = [
+  { type: "rose",      pos: [ 0.00, 1.05,  0.00], dir: [ 0.00, 1.00,  0.05], size: 0.40, color: [235,  35,  55] },
+  { type: "rose",      pos: [-0.45, 0.85,  0.22], dir: [-0.50, 0.85,  0.25], size: 0.33, color: [255, 120, 170] },
+  { type: "sunflower", pos: [ 0.50, 0.90, -0.10], dir: [ 0.55, 0.80, -0.10], size: 0.44, color: [255, 200,  30] },
+  { type: "tulip",     pos: [-0.15, 0.95, -0.45], dir: [-0.15, 0.80, -0.55], size: 0.30, color: [175,  90, 235] },
+  { type: "daisy",     pos: [ 0.22, 0.78,  0.50], dir: [ 0.30, 0.70,  0.65], size: 0.33, color: [248, 248, 255] },
+  { type: "lily",      pos: [-0.62, 0.62, -0.25], dir: [-0.80, 0.55, -0.30], size: 0.38, color: [255, 140,  40], color2: [255, 225, 120] },
+  { type: "tulip",     pos: [ 0.58, 0.60,  0.35], dir: [ 0.75, 0.55,  0.40], size: 0.28, color: [255,  70, 115] },
+  { type: "rose",      pos: [ 0.15, 0.82, -0.58], dir: [ 0.20, 0.60, -0.80], size: 0.30, color: [255, 215,  75] },
+  { type: "lily",      pos: [-0.22, 0.66,  0.62], dir: [-0.25, 0.55,  0.80], size: 0.34, color: [255, 105, 180], color2: [255, 238, 245] },
+  { type: "daisy",     pos: [ 0.62, 0.45, -0.45], dir: [ 0.70, 0.40, -0.60], size: 0.30, color: [200, 160, 255] },
+  { type: "tulip",     pos: [-0.58, 0.45,  0.48], dir: [-0.60, 0.45,  0.65], size: 0.27, color: [255, 200,  60] },
+];
+flowers.forEach((f, i) => { f.B = basisFrom(f.pos, f.dir); f.grp = i + 1; f.seed = rand() * TAU; f.buf = new Buf(); f.lastB = -1; });
+
+function genFlower(fl, b, buf) {
+  buf.n = 0;
+  if (b <= 0) return;
+  const op = 1 - Math.pow(1 - b, 3);            // eased opening 0..1
+  const s = fl.size * 1.25 * (0.2 + 0.8 * op);
+  const B = fl.B, g = fl.grp;
+
+  // little green sepals under every flower
+  for (let k = 0; k < 5; k++) {
+    const phi = k / 5 * TAU + fl.seed;
+    surf(buf, B, 4, 6, (t, sp) => {
+      const a = phi + (t * 2 - 1) * 0.25 * Math.sin(Math.PI * (0.1 + 0.9 * sp)), d = sp * s * 0.28;
+      return [d * Math.cos(a), -0.02 * s + d * 0.25, d * Math.sin(a)];
+    }, [60, 150, 60], g, 0);
+  }
+
+  if (fl.type === "rose") {
+    for (let Ly = 0; Ly < 6; Ly++) {
+      const rs = (Ly + 1) / 6, p = 5, off = Ly * 2.1 + fl.seed;
+      surf(buf, B, 34 + Ly * 8, 12, (u, v) => {
+        const th = u * TAU, m = 0.75 + 0.25 * Math.cos(p * th + off);
+        const rad = s * 0.5 * rs * m * (0.3 + 0.7 * Math.sin(v * Math.PI / 2)) * (0.45 + 0.55 * op) + s * 0.22 * rs * rs * v * v * v * op;
+        const y = s * (v * (0.5 - 0.18 * rs) + 0.12 * (1 - rs));
+        return [rad * Math.cos(th), y, rad * Math.sin(th)];
+      }, (u, v) => shade(fl.color, 0.55 + 0.4 * rs + 0.12 * v), g, 0,
+      (u, v) => v <= 0.72 + 0.28 * (0.5 + 0.5 * Math.cos(p * u * TAU + off)), true);
+    }
+  } else if (fl.type === "tulip") {
+    for (let Ly = 0; Ly < 2; Ly++) {
+      const off = Ly * Math.PI / 3 + fl.seed, sc = Ly ? 0.9 : 1;
+      surf(buf, B, 64, 16, (u, v) => {
+        const th = u * TAU;
+        const r = s * 0.34 * sc * Math.pow(Math.sin(Math.PI * (0.1 + 0.72 * v)), 0.9) * (0.6 + 0.4 * op) + s * 0.07 * v * v * op;
+        return [r * Math.cos(th), s * 0.95 * v * (1.05 - 0.05 * Ly), r * Math.sin(th)];
+      }, (u, v) => shade(fl.color, 0.7 + 0.35 * v - 0.1 * Ly), g, 0,
+      (u, v) => v <= 0.7 + 0.3 * Math.abs(Math.cos(1.5 * (u * TAU - off))), true);
+    }
+  } else if (fl.type === "daisy" || fl.type === "sunflower") {
+    const sun = fl.type === "sunflower";
+    const n = sun ? 18 : 16, c = s * (sun ? 0.3 : 0.18), Lp = s * (sun ? 0.5 : 0.6);
+    for (let row = 0; row < 2; row++) {
+      for (let i = 0; i < n; i++) {
+        const phi = i / n * TAU + row * Math.PI / n + fl.seed, lift = (1 - op) * 1.25 + row * 0.15;
+        surf(buf, B, 6, 12, (t, sp) => {
+          const tt = t * 2 - 1;
+          const w = (Math.PI / n) * 0.9 * Math.pow(Math.sin(Math.PI * (0.08 + 0.92 * sp)), 0.6);
+          const ang = phi + tt * w, d = sp * Lp, rh = c * 0.9 + d * Math.cos(lift);
+          const y = d * Math.sin(lift) - 0.12 * Lp * sp * sp * op + 0.02 * s * Math.abs(tt) + 0.02 * s - row * 0.01 * s;
+          return [rh * Math.cos(ang), y, rh * Math.sin(ang)];
+        }, (t, sp) => shade(fl.color, 0.8 + 0.25 * sp - 0.15 * row), g, 0);
+      }
+    }
+    surf(buf, B, 48, 10, (u, v) => {
+      const th = u * TAU, r = v * c;
+      return [r * Math.cos(th), c * 0.4 * (1 - v * v) * (0.5 + 0.5 * op) + 0.03 * s, r * Math.sin(th)];
+    }, (u, v) => sun ? shade([120, 65, 20], 0.55 + 0.45 * Math.abs(Math.sin(v * 25 + u * TAU * 13)))
+                     : shade([255, 195, 40], 0.85 + 0.15 * Math.sin(v * 30)), g, 0, null, true);
+  } else if (fl.type === "lily") {
+    const Lp = s * 0.75;
+    for (let i = 0; i < 6; i++) {
+      const phi = i / 6 * TAU + fl.seed;
+      surf(buf, B, 9, 16, (t, sp) => {
+        const tt = t * 2 - 1;
+        const w = 0.5 * Math.pow(Math.sin(Math.PI * (0.12 + 0.88 * sp)), 0.7) * (1 - 0.25 * sp);
+        const ang = phi + tt * w;
+        const rd = Lp * (0.1 + sp * (0.45 + 0.5 * op));
+        const y = Lp * (1.0 * sp - 0.5 * op * sp * sp * sp) + 0.05 * Lp * Math.abs(tt) * sp;
+        return [rd * Math.cos(ang), y, rd * Math.sin(ang)];
+      }, (t, sp) => mix(mix(fl.color2, fl.color, Math.min(1, sp * 1.6)), [255, 255, 255], Math.abs(t * 2 - 1) * 0.25), g, 0);
+    }
+    // stamens
+    for (let k = 0; k < 6; k++) {
+      const phi = k / 6 * TAU + fl.seed + 0.5;
+      for (let j = 0; j <= 14; j++) {
+        const sp = j / 14, d = 0.22 * Lp * sp;
+        pushLocal(buf, B, [d * Math.cos(phi), Lp * 0.85 * sp, d * Math.sin(phi)], [0, 1, 0],
+          j > 12 ? [170, 70, 20] : [220, 240, 170], g, 0);
+      }
+    }
+  }
+}
+
+// ===================== static parts: stems, leaves, paper cone, ribbon =====================
+const staticBuf = new Buf();
+function bez(a, b, c, t) { const m = 1 - t; return [m * m * a[0] + 2 * m * t * b[0] + t * t * c[0], m * m * a[1] + 2 * m * t * b[1] + t * t * c[1], m * m * a[2] + 2 * m * t * b[2] + t * t * c[2]]; }
+function genStatic() {
+  const buf = staticBuf;
+  // stems
+  flowers.forEach(fl => {
+    const d = norm(fl.dir);
+    const P2 = [fl.pos[0] - d[0] * 0.02, fl.pos[1] - d[1] * 0.02, fl.pos[2] - d[2] * 0.02];
+    const P1 = [fl.pos[0] * 0.12, -0.62, fl.pos[2] * 0.12];
+    const P0 = [fl.pos[0] * 0.28 + (rand() - 0.5) * 0.05, -1.72 - rand() * 0.08, fl.pos[2] * 0.28];
+    const green = [55 + rand() * 30, 150 + rand() * 50, 55 + rand() * 25];
+    const N = 90;
+    for (let k = 0; k <= N; k++) {
+      const s = k / N, Q = bez(P0, P1, P2, s), Q2 = bez(P0, P1, P2, Math.min(1, s + 0.01));
+      let tg = norm([Q2[0] - Q[0], Q2[1] - Q[1], Q2[2] - Q[2]]);
+      if (s >= 1) tg = d;
+      const B = basisFrom(Q, tg);
+      for (let m = 0; m < 7; m++) {
+        const a = m / 7 * TAU, ca = Math.cos(a), sa = Math.sin(a), r = 0.022;
+        pushLocal(buf, B, [ca * r, 0, sa * r], [ca, 0, sa], shade(green, 0.85 + 0.15 * Math.sin(s * 30)), fl.grp, s * 0.999);
+      }
+    }
+  });
+  // leaves
+  for (let k = 0; k < 8; k++) {
+    const a = k / 8 * TAU + 0.35, Lf = 0.55 + rand() * 0.25;
+    const ca = Math.cos(a), sa = Math.sin(a), b0 = [0.5 * ca, 0.22, 0.5 * sa];
+    const col = [50 + rand() * 40, 140 + rand() * 60, 50 + rand() * 30];
+    surf(buf, WORLD, 9, 22, (t, sp) => {
+      const tt = t * 2 - 1, w = 0.15 * Lf * Math.pow(Math.sin(Math.PI * sp), 0.8) * tt, al = sp * Lf;
+      const up = al * 0.55 - 0.75 * Lf * sp * sp * 0.6 + 0.05 * Lf * Math.abs(tt);
+      return [b0[0] + ca * al * 0.85 - sa * w, b0[1] + up, b0[2] + sa * al * 0.85 + ca * w];
+    }, (t, sp) => shade(col, 0.8 + 0.25 * Math.abs(t * 2 - 1)), 20 + k, (t, sp) => 0.5 + 0.5 * sp);
+  }
+  // baby's breath
+  for (let k = 0; k < 9; k++) {
+    const a = rand() * TAU, rr = 0.55 + rand() * 0.25, cy0 = 0.5 + rand() * 0.45;
+    for (let b = 0; b < 5; b++) {
+      const c = [rr * Math.cos(a) + (rand() - 0.5) * 0.15, cy0 + (rand() - 0.5) * 0.12, rr * Math.sin(a) + (rand() - 0.5) * 0.15];
+      for (let j = 0; j < 22; j++) {
+        const n = norm([rand() - 0.5, rand() - 0.5, rand() - 0.5]), r = 0.035;
+        buf.push(c[0] + n[0] * r, c[1] + n[1] * r, c[2] + n[2] * r, n[0], n[1], n[2], 250, 248, 255, 40 + k, 0.95);
+      }
+    }
+  }
+  // wrapping paper cone (cream + blush stripes, folded)
+  surf(buf, WORLD, 170, 54, (u, h) => {
+    const th = u * TAU;
+    const r = (0.13 + 0.62 * h + 0.14 * h * h * h * h) * (1 + 0.05 * Math.sin(u * TAU * 9) * h);
+    return [r * Math.cos(th), -0.78 + h * 1.05, r * Math.sin(th)];
+  }, (u, h) => (Math.floor(u * 18) % 2 ? [252, 238, 218] : [248, 190, 210]), 0, 0, null, true);
+  // ribbon band
+  surf(buf, WORLD, 80, 6, (u, w) => {
+    const th = u * TAU, r = 0.19;
+    return [r * Math.cos(th), -0.76 + 0.09 * w, r * Math.sin(th)];
+  }, [255, 70, 150], 0, 0, null, true);
+  // bow loops + tails
+  for (const k of [-1, 1]) {
+    surf(buf, WORLD, 40, 5, (u, w) => {
+      const a = u * TAU, ww = w * 2 - 1;
+      return [k * (0.02 + 0.14 * (1 - Math.cos(a))), -0.71 + 0.08 * Math.sin(a) + ww * 0.03, 0.22 + 0.04 * (1 - Math.cos(a)) * 0.5];
+    }, [255, 85, 160], 0, 0, null, true);
+    surf(buf, WORLD, 5, 30, (w, s) => {
+      const ww = w * 2 - 1;
+      return [k * (0.03 + 0.13 * s) + ww * 0.035, -0.73 - 0.45 * s, 0.22 + 0.04 * Math.sin(s * 6)];
+    }, (w, s) => shade([255, 70, 150], 0.85 + 0.15 * Math.sin(s * 12)), 0, 0);
+  }
+  for (let j = 0; j < 60; j++) {
+    const n = norm([rand() - 0.5, rand() - 0.5, rand() - 0.5]);
+    buf.push(n[0] * 0.04, -0.71 + n[1] * 0.04, 0.23 + n[2] * 0.04, n[0], n[1], n[2], 255, 60, 140, 0, 0);
+  }
+}
+genStatic();
+
+// ===================== extras: petals, sparkles, stars =====================
+const PETAL_COLORS = [[255, 120, 170], [255, 80, 120], [255, 170, 200], [235, 40, 60], [255, 210, 230]];
+const petals = Array.from({ length: 38 }, () => newPetal(true));
+function newPetal(anywhere) {
+  return { x: (rand() - 0.5) * 3.2, y: anywhere ? -1.8 + rand() * 3.6 : 1.8 + rand() * 0.4, z: (rand() - 0.5) * 2.4,
+           vy: 0.12 + rand() * 0.18, ph: rand() * TAU, c: PETAL_COLORS[(rand() * PETAL_COLORS.length) | 0] };
+}
+const sparkles = Array.from({ length: 34 }, () => {
+  const a = rand() * TAU, r = 0.9 + rand() * 0.6;
+  return { x: r * Math.cos(a), y: -0.1 + rand() * 1.6, z: r * Math.sin(a), ph: rand() * TAU, rate: 1.5 + rand() * 2.5 };
+});
+let stars = [];
+
+// ===================== canvas / grid =====================
+const canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+let W, H, cols, rows, cellW, cellH, fs, S, cx, cy, zbuf, chbuf, colbuf;
+function resize() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + "px"; canvas.style.height = H + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  fs = Math.max(6, Math.min(14, Math.floor(Math.min(W / (150 * 0.6), H / 85))));
+  ctx.font = `bold ${fs}px "Courier New", monospace`;
+  ctx.textBaseline = "top";
+  cellW = ctx.measureText("M").width; cellH = fs * 1.05;
+  cols = Math.ceil(W / cellW); rows = Math.ceil(H / cellH);
+  zbuf = new Float32Array(cols * rows); chbuf = new Int16Array(cols * rows); colbuf = new Uint32Array(cols * rows);
+  S = Math.min(H * 0.8 / 3.5, W * 0.9 / 3.0);
+  cx = W / 2; cy = H * 0.45 - 0.2 * S;
+  stars = [];
+  const count = (cols * rows * 0.012) | 0;
+  for (let i = 0; i < count; i++) stars.push({ idx: (Math.random() * cols * rows) | 0, ph: Math.random() * TAU, rate: 0.5 + Math.random() * 2 });
+}
+addEventListener("resize", resize);
+resize();
+
+// ===================== render =====================
+const swx = new Float32Array(64), swz = new Float32Array(64);
+let cA, sA, cT = Math.cos(TILT), sT = Math.sin(TILT);
+
+function plot(x, y, z, spin, chIdx, rgb) {
+  let x1 = x, z1 = z;
+  if (spin) { x1 = x * cA + z * sA; z1 = -x * sA + z * cA; }
+  const y2 = y * cT - z1 * sT, z2 = y * sT + z1 * cT;
+  const ooz = 1 / (D - z2);
+  const col = ((cx + x1 * S * D * ooz) / cellW) | 0, row = ((cy - y2 * S * D * ooz) / cellH) | 0;
+  if (col < 0 || col >= cols || row < 0 || row >= rows) return;
+  const idx = row * cols + col;
+  if (ooz <= zbuf[idx]) return;
+  zbuf[idx] = ooz; chbuf[idx] = chIdx; colbuf[idx] = rgb;
+}
+
+function renderBuf(buf, grow) {
+  const a = buf.a, n = buf.n, kS = S * D;
+  for (let k = 0; k < n; k++) {
+    const o = k * ST;
+    if (a[o + 10] > grow) continue;
+    let x = a[o], y = a[o + 1], z = a[o + 2];
+    const h = y + 0.75;
+    if (h > 0) { const g = a[o + 9], hh = h * h; x += swx[g] * hh; z += swz[g] * hh; }
+    const x1 = x * cA + z * sA, z1 = -x * sA + z * cA;
+    const y2 = y * cT - z1 * sT, z2 = y * sT + z1 * cT;
+    const ooz = 1 / (D - z2);
+    const col = ((cx + x1 * kS * ooz) / cellW) | 0, row = ((cy - y2 * kS * ooz) / cellH) | 0;
+    if (col < 0 || col >= cols || row < 0 || row >= rows) continue;
+    const idx = row * cols + col;
+    if (ooz <= zbuf[idx]) continue;
+    const nx = a[o + 3], ny = a[o + 4], nz = a[o + 5];
+    let nx1 = nx * cA + nz * sA; const nz1 = -nx * sA + nz * cA;
+    let ny2 = ny * cT - nz1 * sT, nz2 = ny * sT + nz1 * cT;
+    if (nz2 < 0) { nx1 = -nx1; ny2 = -ny2; nz2 = -nz2; }   // petals are two-sided
+    let d = nx1 * L[0] + ny2 * L[1] + nz2 * L[2]; if (d < 0) d = 0;
+    const lum = 0.15 + 0.85 * d, sh = 0.4 + 0.75 * lum;
+    const r = Math.min(255, a[o + 6] * sh) | 0, g = Math.min(255, a[o + 7] * sh) | 0, b = Math.min(255, a[o + 8] * sh) | 0;
+    zbuf[idx] = ooz; chbuf[idx] = (lum * (RL - 1) + 0.5) | 0; colbuf[idx] = (r << 16) | (g << 8) | b;
+  }
+}
+
+const colorCache = new Map();
+function css(c) { let s = colorCache.get(c); if (!s) { s = "#" + (c | 0x1000000).toString(16).slice(1); colorCache.set(c, s); } return s; }
+const rgbInt = (c, k) => ((Math.min(255, c[0] * k) | 0) << 16) | ((Math.min(255, c[1] * k) | 0) << 8) | (Math.min(255, c[2] * k) | 0);
+
+const msg = document.getElementById("msg");
+const start = performance.now();
+let last = start;
+const order = flowers.map((f, i) => i);   // already listed from the centre outwards
+
+function frame(now) {
+  const t = (now - start) / 1000, dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const A = t * SPIN_SPEED; cA = Math.cos(A); sA = Math.sin(A);
+  for (let g = 0; g < 64; g++) {
+    const amp = g === 0 ? SWAY * 0.5 : SWAY, ph = g * 2.39;
+    swx[g] = amp * Math.sin(t * 1.1 + ph); swz[g] = amp * 0.7 * Math.cos(t * 0.85 + ph * 1.3);
+  }
+  zbuf.fill(0); chbuf.fill(-1);
+
+  // bloom-in intro
+  const grow = clamp01(t / 1.6);
+  renderBuf(staticBuf, grow);
+  order.forEach((i, k) => {
+    const fl = flowers[i], b = clamp01((t - 0.9 - k * 0.2) / 1.7);
+    if (b !== fl.lastB) { genFlower(fl, b, fl.buf); fl.lastB = b; }
+    renderBuf(fl.buf, 1);
+  });
+  if (t > 4.6) msg.classList.add("show");
+
+  // sparkles around the bouquet (spin with it)
+  if (t > 2) for (const sp of sparkles) {
+    const i = Math.pow(Math.max(0, Math.sin(t * sp.rate + sp.ph)), 6);
+    if (i < 0.15) continue;
+    plot(sp.x, sp.y, sp.z, true, CH.indexOf(i > 0.7 ? "*" : i > 0.4 ? "+" : "."), rgbInt([255, 240, 200], 0.5 + 0.5 * i));
+  }
+  // falling petals (don't spin, they just drift)
+  for (let k = 0; k < petals.length; k++) {
+    const p = petals[k];
+    p.y -= p.vy * dt; p.ph += dt * 1.7;
+    if (p.y < -1.9) petals[k] = newPetal(false);
+    const ch = "~,'`*"[((p.ph * 1.3) | 0) % 5];
+    plot(p.x + 0.12 * Math.sin(p.ph), p.y, p.z + 0.08 * Math.cos(p.ph * 0.7), false, CH.indexOf(ch), rgbInt(p.c, 0.9));
+  }
+  // twinkling stars in empty cells
+  for (const st of stars) {
+    if (st.idx >= chbuf.length || chbuf[st.idx] >= 0) continue;
+    const b = 0.25 + 0.75 * Math.pow(0.5 + 0.5 * Math.sin(t * st.rate + st.ph), 3);
+    chbuf[st.idx] = CH.indexOf(b > 0.85 ? "+" : ".");
+    colbuf[st.idx] = rgbInt([190, 200, 255], b * 0.8);
+  }
+
+  // draw the character grid
+  ctx.fillStyle = "#05040d"; ctx.fillRect(0, 0, W, H);
+  let lastCol = -1;
+  for (let row = 0; row < rows; row++) {
+    const y = row * cellH, base = row * cols;
+    for (let col = 0; col < cols; col++) {
+      const ci = chbuf[base + col];
+      if (ci < 0) continue;
+      const c = colbuf[base + col];
+      if (c !== lastCol) { ctx.fillStyle = css(c); lastCol = c; }
+      ctx.fillText(CH[ci], col * cellW, y);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+
+</body>
+</html>
